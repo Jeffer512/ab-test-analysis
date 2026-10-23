@@ -1,0 +1,38 @@
+[project]
+name = "abtest"
+version = "0.1.0"
+description = "Validity checks, inference, and decision analysis for the Criteo uplift A/B experiment"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.6,<2",
+    "numpy>=2.4.6,<3",
+    "pandas>=3.0,<4",
+    "scipy>=1.17,<2",
+    "statsmodels>=0.15,<0.16",
+    "matplotlib>=3.11,<4",
+    "seaborn>=0.13,<0.14",
+    "scikit-learn>=1.9,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1,<10",
+    "ruff>=0.17,<0.18",
+    "ipykernel>=7.4,<8",
+    "nbconvert>=7.17,<8",
+    "notebook>=7.6,<8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/abtest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
