@@ -11,6 +11,10 @@ DATA_PATH = Path(__file__).resolve().parents[2] / "data" / DATA_FILE
 
 RAW_TABLE = "raw"
 
+# Explicit schema: read_csv_auto infers the flag columns as BIGINT
+FLAG_COLS = ("treatment", "conversion", "visit", "exposure")
+COLUMNS = {**{f"f{i}": "DOUBLE" for i in range(12)}, **{c: "BOOLEAN" for c in FLAG_COLS}}
+
 
 def data_path() -> Path:
     return DATA_PATH
@@ -43,11 +47,11 @@ def connect(path: Path | None = None, materialize: bool = True) -> duckdb.DuckDB
         conn.execute("SET enable_progress_bar=false")
     rel_kind = "TABLE" if materialize else "VIEW"
     t0 = time.time()
-    print(f"loading {p.name} (≈1 minute) ...", flush=True)
+    print(f"loading {p.name}...", flush=True)
     conn.execute(
         f"""
         CREATE OR REPLACE {rel_kind} {RAW_TABLE} AS
-        SELECT * FROM read_csv_auto('{p.as_posix()}', sample_size=-1)
+        SELECT * FROM read_csv('{p.as_posix()}', columns={COLUMNS}, compression='gzip', header=true)
         """
     )
     if materialize:
