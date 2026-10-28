@@ -129,21 +129,19 @@ def _chi2_share(table: np.ndarray) -> tuple[float, float, int]:
 @dataclass(frozen=True)
 class IndependenceResult:
     feature: str
-    method: str                 # "levels" | "quantiles"
+    method: str                  # "levels" | "quantiles"
     groups: int
     chi2: float
     p_value: float
     dof: int
     share_range_pp: float        # (max - min) treated share across groups, in pp
-    shares: pd.DataFrame         # group, n, n_treatment, treatment_share
+    weighted_share_sd_pp: float  # mass-weighted standard deviation of treated share, in pp
+    drift_mass_pct: float        # % of all users in strata deviating > MATERIAL_SHARE_DRIFT_PP from pooled share
+    shares: pd.DataFrame         # group, n_total, n_treatment, treatment_share
 
     @property
     def stable(self) -> bool:
-        """Practical stability: negligible drift in percentage points.
-
-        The χ² p-value at n≈14M rejects for trivial deviations, so
-        materiality — not significance — decides.
-        """
+        """Practical stability: conservative range heuristic."""
         return self.share_range_pp <= MATERIAL_SHARE_DRIFT_PP
 
 
@@ -158,9 +156,10 @@ def share_independence(
     Discrete features (≤ ``MAX_LEVEL_CARDINALITY``) use an exact-value
     chi-square; continuous ones use deterministic quantile bins — never
     ``NTILE(ORDER BY f)``, which nondeterministically splits through giant
-    tied blocks. The practical signal is ``share_range_pp``: at n ≈ 14M the
-    chi-square p-value rejects trivial drift, so materiality decides
-    (see ``IndependenceResult.stable``).
+    tied blocks. 
+
+    Reports both range (sensitive to tail noise), weighted SD and mass-weighted
+    dispersion (representative of actual population drift).
     """
     if feature not in _available_features(conn, rel):
         raise ValueError(f"Feature {feature!r} not found in {rel!r}")
@@ -170,8 +169,6 @@ def share_independence(
         # Exact-value test; collapse vanishingly rare levels so expected
         # counts stay valid for the chi-square approximation.
         counts = conn.execute(
-            # treatment cast to INT: as BOOLEAN it would pivot to n_False/n_True
-            # columns and silently break the n_1 lookup below
             f"SELECT {feature} AS v, treatment::INT AS treatment, COUNT(*) AS n "
             f"FROM {rel} GROUP BY 1, 2"
         ).df()
@@ -189,7 +186,7 @@ def share_independence(
             counts.groupby(["v", "treatment"])["n"].sum().unstack(fill_value=0)
         )
         shares.columns = [f"n_{c}" for c in shares.columns]
-        shares["n_total"] = shares.sum(axis=1)  # only n_0/n_1 exist here
+        shares["n_total"] = shares.sum(axis=1)
         shares["n_treatment"] = shares["n_1"] if "n_1" in shares.columns else 0
         out = shares.reset_index().rename(columns={"v": "group"})
         out["treatment_share"] = out["n_treatment"] / out["n_total"]
@@ -219,6 +216,23 @@ def share_independence(
     share_range_pp = float(
         (out["treatment_share"].max() - out["treatment_share"].min()) * 100
     )
+
+    ntot = out["n_total"].to_numpy(dtype=float)
+    ntreat = out["n_treatment"].to_numpy(dtype=float)
+    q = out["treatment_share"].to_numpy(dtype=float)
+
+    total_rows = ntot.sum()
+    q_pooled = ntreat.sum() / total_rows if total_rows > 0 else 0.0
+
+    # Mass-weighted SD of treated share (in percentage points)
+    weighted_var = np.average((q - q_pooled) ** 2, weights=ntot) if total_rows > 0 else 0.0
+    weighted_share_sd_pp = float(np.sqrt(weighted_var) * 100)
+
+    # Share of users living in strata that deviate > MATERIAL_SHARE_DRIFT_PP from baseline
+    drift_threshold = MATERIAL_SHARE_DRIFT_PP / 100.0
+    drifting_mask = np.abs(q - q_pooled) > drift_threshold
+    drift_mass_pct = float((ntot[drifting_mask].sum() / total_rows) * 100) if total_rows > 0 else 0.0
+
     return IndependenceResult(
         feature=feature,
         method=method,
@@ -227,6 +241,8 @@ def share_independence(
         p_value=p,
         dof=dof,
         share_range_pp=share_range_pp,
+        weighted_share_sd_pp=weighted_share_sd_pp,
+        drift_mass_pct=drift_mass_pct,
         shares=out,
     )
 
@@ -234,7 +250,7 @@ def share_independence(
 def assignment_report(
     conn: duckdb.DuckDBPyConnection, bins: int = 5, rel: str = RAW_TABLE
 ) -> pd.DataFrame:
-    """One row per feature: method, χ², p, and the material share-range (pp)."""
+    """One row per feature with raw range, weighted SD, and drifting population mass."""
     rows = []
     for f in _available_features(conn, rel):
         r = share_independence(conn, f, bins=bins, rel=rel)
@@ -247,11 +263,12 @@ def assignment_report(
                 "dof": r.dof,
                 "p_value": r.p_value,
                 "share_range_pp": r.share_range_pp,
+                "weighted_share_sd_pp": r.weighted_share_sd_pp,
+                "drift_mass_pct": r.drift_mass_pct,
                 "negligible_drift": r.stable,
             }
         )
     return pd.DataFrame(rows).sort_values("share_range_pp", ascending=False).reset_index(drop=True)
-
 
 @dataclass(frozen=True)
 class StandardizedATEResult:
