@@ -5,6 +5,9 @@ import duckdb
 import numpy as np
 import pandas as pd
 from scipy import stats
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
 
 from abtest.load import RAW_TABLE
 
@@ -332,4 +335,121 @@ def standardized_ate(
         strata=card if method == "levels" else 5,
         covered_rows=int(row[1]),
         dropped_rows=int(row[2]),
+    )
+
+
+C2ST_MATERIAL_GAP = 0.05        # practical threshold on auc - null_auc
+C2ST_TRAIN_ROWS = 1_000_000     # default size of the balanced training sample
+C2ST_NULL_ROWS = 100_000        # rows per label-permuted null fit
+
+
+@dataclass(frozen=True)
+class C2STResult:
+    """C2ST: out-of-fold assignment-prediction AUC against a permuted null."""
+
+    auc: float            # pooled out-of-fold AUC on the real assignment
+    fold_aucs: tuple[float, ...]
+    null_auc_mean: float  # label-permuted refits (smaller sample)
+    null_auc_sd: float
+    n_rows: int
+    features: tuple[str, ...]
+    random_state: int
+    model: str
+
+    @property
+    def auc_gap(self) -> float:
+        return self.auc - self.null_auc_mean
+
+    @property
+    def material(self) -> bool:
+        """Gap large enough to act on — independent of n's p-value pressure."""
+        return self.auc_gap >= C2ST_MATERIAL_GAP
+
+
+def _balanced_sample(
+    conn: duckdb.DuckDBPyConnection, rows: int, seed: int, rel: str
+) -> pd.DataFrame:
+    """Reservoir sample ``rows`` rows, half from each arm.
+
+    Class-balancing decouples the AUC from the base treated share.
+    """
+    features = _available_features(conn, rel)
+    cols = ", ".join(features)
+    half = max(rows // 2, 1)
+    parts = []
+    for arm in (0, 1):
+        parts.append(
+            f"SELECT {cols}, {arm} AS treatment "
+            f"FROM (SELECT {cols} FROM {rel} WHERE treatment = {arm}) "
+            f"USING SAMPLE {half} ROWS (reservoir, {seed + arm})"
+        )
+    return conn.execute(" UNION ALL ".join(parts)).df()
+
+
+def c2st_validity(
+    conn: duckdb.DuckDBPyConnection,
+    features: list[str] | None = None,
+    n_rows: int = C2ST_TRAIN_ROWS,
+    folds: int = 5,
+    null_runs: int = 5,
+    null_rows: int = C2ST_NULL_ROWS,
+    rel: str = RAW_TABLE,
+    random_state: int = 42,
+) -> C2STResult:
+    """Can a classifier predict ``treatment`` from the pre-treatment features?
+
+    C2ST: histogram-gradient-boosted trees are cross-validated on a
+    class-balanced sample, and the pooled out-of-fold AUC is compared to a
+    label-permuted null.
+    """
+    available = _available_features(conn, rel)
+    fs = list(features) if features is not None else available
+    unknown = [f for f in fs if f not in available]
+    if unknown:
+        raise ValueError(f"Feature(s) {unknown} not found in {rel!r}")
+    if not fs:
+        raise ValueError(f"No experiment features (f0..f11) found in {rel!r}")
+    if folds < 2:
+        raise ValueError("Need at least 2 folds for out-of-fold AUC")
+    if null_runs < 1:
+        raise ValueError("Need at least one null run to establish the null")
+
+    df = _balanced_sample(conn, n_rows, random_state, rel)
+    X = df[fs].to_numpy()
+    y = df["treatment"].to_numpy()
+
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
+    proba = cross_val_predict(
+        HistGradientBoostingClassifier(random_state=random_state),
+        X, y, cv=cv, method="predict_proba",
+    )[:, 1]
+    auc = float(roc_auc_score(y, proba))
+    fold_aucs = tuple(
+        float(roc_auc_score(y[test], proba[test])) for _, test in cv.split(X, y)
+    )
+
+    rng = np.random.default_rng(random_state)
+    null_auc = np.empty(null_runs, dtype=float)
+    for i in range(null_runs):
+        null_df = _balanced_sample(conn, null_rows, random_state + 10_000 + i, rel)
+        Xn = null_df[fs].to_numpy()
+        yn = rng.permutation(null_df["treatment"].to_numpy())
+        Xn_tr, Xn_te, yn_tr, yn_te = train_test_split(
+            Xn, yn, test_size=0.25, shuffle=True, random_state=random_state + i
+        )
+        null_model = HistGradientBoostingClassifier(random_state=random_state)
+        null_model.fit(Xn_tr, yn_tr)
+        null_auc[i] = roc_auc_score(
+            yn_te, null_model.predict_proba(Xn_te)[:, 1]
+        )
+
+    return C2STResult(
+        auc=auc,
+        fold_aucs=fold_aucs,
+        null_auc_mean=float(null_auc.mean()),
+        null_auc_sd=float(null_auc.std()),
+        n_rows=len(y),
+        features=tuple(fs),
+        random_state=random_state,
+        model="HistGradientBoostingClassifier",
     )

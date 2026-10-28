@@ -5,8 +5,10 @@ import pytest
 
 from abtest.validity import (
     MAX_LEVEL_CARDINALITY,
+    _balanced_sample,
     assignment_report,
     bin_expression,
+    c2st_validity,
     feature_balance,
     quantile_boundaries,
     share_independence,
@@ -214,3 +216,75 @@ def test_standardized_ate_outcome_validation():
     conn = make_conn(n=2_000)
     with pytest.raises(ValueError):
         standardized_ate(conn, "f0", "revenue")
+
+
+# --- C2ST ----------------------------------------------------------
+
+
+def c2st(conn):
+    """Default C2ST config for the synthetic fixtures (fast, deterministic)."""
+    return c2st_validity(conn, n_rows=60_000, folds=3, null_runs=2, null_rows=10_000)
+
+
+def test_c2st_balanced_sample_is_actually_balanced():
+    """Guard against DuckDB pushing USING SAMPLE below the arm filter — the
+    sample must happen after the filter, else arms come out 85/15 again."""
+    rng = np.random.default_rng(1)
+    n = 200_000
+    df = pd.DataFrame(
+        {
+            "f0": rng.normal(size=n),
+            "treatment": (rng.random(n) < 0.85).astype(bool),
+            "conversion": (rng.random(n) < 0.02).astype(bool),
+            "visit": (rng.random(n) < 0.05).astype(bool),
+        }
+    )
+    conn = duckdb.connect()
+    conn.register("raw_df", df)
+    conn.execute("CREATE VIEW raw AS SELECT * FROM raw_df")
+
+    sample = _balanced_sample(conn, 40_000, seed=42, rel="raw")
+    per_arm = sample["treatment"].value_counts().to_list()
+    assert per_arm == [20_000, 20_000]
+    assert sorted(sample.columns) == ["f0", "treatment"]
+
+
+def test_c2st_flags_planted_assignment_drift():
+    share_by_level = [0.70, 0.70, 0.70, 0.70, 0.70, 0.95, 0.95, 0.95, 0.95, 0.95]
+    conn = make_conn(share_by_level=share_by_level, n=60_000)
+    r = c2st(conn)
+    assert r.auc > 0.70          # assignment highly predictable from f3
+    assert r.material
+    assert r.features == ("f0", "f3")
+    assert r.model == "HistGradientBoostingClassifier"
+
+
+def test_c2st_null_on_balanced_data():
+    conn = make_conn(n=60_000)
+    r = c2st(conn)
+    assert r.auc < 0.60          # close to coin flip on independent assignment
+    assert not r.material
+
+
+def test_c2st_deterministic_given_seed():
+    r1 = c2st(make_conn(n=40_000, seed=5))
+    r2 = c2st(make_conn(n=40_000, seed=5))
+    assert r1.auc == pytest.approx(r2.auc, abs=1e-9)
+    assert r1.null_auc_mean == pytest.approx(r2.null_auc_mean, abs=1e-9)
+
+
+def test_c2st_validates_features_and_arguments():
+    conn = make_conn(n=20_000)
+    r = c2st_validity(conn, features=["f3"], n_rows=20_000, folds=2,
+                      null_runs=1, null_rows=5_000)
+    assert r.features == ("f3",)
+
+    with pytest.raises(ValueError):  # unknown feature requested
+        c2st_validity(conn, features=["f99"])
+    with pytest.raises(ValueError):  # relation without any feature columns
+        bare = duckdb.connect()
+        bare.execute("CREATE VIEW raw AS SELECT 1::INT treatment")
+        c2st_validity(bare)
+    with pytest.raises(ValueError):  # 1 fold cannot give out-of-fold AUC
+        c2st_validity(conn, folds=1, null_runs=1)
+
